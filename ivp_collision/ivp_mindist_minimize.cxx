@@ -2,6 +2,8 @@
 
 #include <ivp_physics.hxx>
 
+#include "tier0/dbg.h"	// HL2SB: Warning for the corrupt-ledge guard below
+
 #if defined(LINUX) || defined(SUN) || (__MWERKS__ && __POWERPC__)
 #   include <alloca.h>
 #endif
@@ -638,6 +640,21 @@ const IVP_Compact_Edge *IVP_Compact_Ledge_Solver::minimize_on_other_side(
     const IVP_Compact_Ledge *c_ledge = edge->get_compact_ledge();
 
     int n_triangles = c_ledge->get_n_triangles();
+    // HL2SB: a stale synapse edge hands us a garbage ledge through pure pointer
+    // arithmetic, and get_n_triangles() is a signed short read at that address.
+    // A negative count used to reach alloca, where the size probe walked off the
+    // stack and killed the process. Refuse anything outside a real ledge range
+    // and hand the entry edge back to the caller: one bad contact, no crash.
+    if ( n_triangles <= 0 || n_triangles > IVP_MAX_TRIANGLES_PER_LEDGE )
+    {
+	static bool s_bComplainedAboutCorruptLedge = false;
+	if ( !s_bComplainedAboutCorruptLedge )
+	{
+	    s_bComplainedAboutCorruptLedge = true;
+	    Warning( "vphysics: mindist pierce rejected a corrupt compact ledge (n_triangles %d)\n", n_triangles );
+	}
+	return edge;
+    }
 #if defined(IVP_NO_ALLOCA)
     uchar pierce_visited_array[IVP_MAX_TRIANGLES_PER_LEDGE];
 #else
@@ -648,12 +665,24 @@ const IVP_Compact_Edge *IVP_Compact_Ledge_Solver::minimize_on_other_side(
     
 
     int pierce_idx = edge->get_triangle()->get_pierce_index();
+    // HL2SB: the precalculated pierce index must point inside this ledge; fall
+    // back to the entry edge's own triangle when it does not.
+    if ( pierce_idx < 0 || pierce_idx >= n_triangles )
+    {
+	pierce_idx = edge->get_triangle()->get_tri_index();
+	if ( pierce_idx < 0 || pierce_idx >= n_triangles )
+	{
+	    return edge;
+	}
+    }
     const IVP_Compact_Triangle *pierced_tri = &c_ledge->get_first_triangle()[pierce_idx];
     
     const IVP_Compact_Edge *F = pierced_tri->get_first_edge(); // precalculated piercing
 
     while(1){
-	pierce_visited_array[F->get_triangle()->get_tri_index()] = 1; // tag triangle as visited
+	int visit_idx = F->get_triangle()->get_tri_index();
+	if ( visit_idx < 0 || visit_idx >= n_triangles ) break; // HL2SB: walked off the ledge
+	pierce_visited_array[visit_idx] = 1; // tag triangle as visited
 	
 	IVP_Unscaled_QR_Result qr;
 	IVP_CLS.calc_unscaled_qr_vals_F_space(c_ledge, F, partner_os, &qr);
@@ -665,6 +694,7 @@ const IVP_Compact_Edge *IVP_Compact_Ledge_Solver::minimize_on_other_side(
 	for (e=F,j=0;j<3;e=e->get_next(),j++){
 	    if (qr.checks[j] > 0.0f ) continue;  // inside triangle
 	    int tri_idx = e->get_opposite()->get_triangle()->get_tri_index();
+	    if ( tri_idx < 0 || tri_idx >= n_triangles ) continue; // HL2SB: neighbor outside this ledge
 	    if(pierce_visited_array[tri_idx]) continue; // already visited
 
 	    F = e->get_opposite();
